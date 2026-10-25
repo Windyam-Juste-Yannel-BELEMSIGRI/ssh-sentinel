@@ -1,0 +1,6 @@
+# Environnements Python
+.venv/
+
+# Données
+data/
+*.log
