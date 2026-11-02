@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# Permet aux tests d'importer "sentinel" depuis le dossier src/
+pythonpath = ["src"]
+testpaths = ["tests"]

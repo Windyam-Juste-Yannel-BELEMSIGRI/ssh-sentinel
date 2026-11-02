@@ -1,246 +1,207 @@
 # ssh-sentinel
 
-**Un pipeline de données qui ingère des logs d'authentification SSH dans PostgreSQL et y détecte les attaques : brute force, password spraying et compromission de compte.**
+Pipeline qui charge des logs d'authentification SSH dans PostgreSQL et qui doit y détecter les attaques (brute force, password spraying, compte compromis) avec des requêtes SQL.
 
-> Projet personnel.
-> Statut : **en cours**. Ingestion brute terminée ; parser, modélisation et détections à venir.
+L'idée de départ : un SOC, c'est d'abord des données. Avant de détecter quoi que ce soit, il faut que les logs soient chargés proprement, découpés et fiables. Donc je fais les deux : la partie data engineering (ingestion, couches, idempotence) et la partie SOC (lire les logs, écrire les règles, les relier à MITRE ATT&CK).
 
----
-
-## Pourquoi ce projet
-
-Un SOC (Security Operations Center) reçoit des millions d'événements par jour. Avant de pouvoir repérer une attaque, il faut que ces événements soient **collectés, structurés et fiables**. Un SOC est donc d'abord un problème de données.
-
-ssh-sentinel réunit les deux métiers sur un cas concret :
-
-| Côté Data Engineering | Côté SOC |
-| --- | --- |
-| Ingestion de fichiers bruts | Lecture et compréhension des logs d'authentification |
-| Modélisation en couches (`raw`, `stg`, `mart`) | Règles de détection écrites en SQL |
-| Chargement idempotent, sans doublons | Rattachement des règles à MITRE ATT&CK |
-| Reproductibilité avec Docker | Analyse et tri des alertes |
+**Où j'en suis :** chargement brut OK, parser OK. Reste le modèle en étoile, les détections et le rapport.
 
 ---
 
-## Architecture
+## Comment c'est organisé
 
-```mermaid
-flowchart LR
-    A["Logs SSH<br/>OpenSSH_2k.log"] --> B["load_raw.py<br/>(Python)"]
-    subgraph PG["PostgreSQL 16 dans Docker, port 5433"]
-        direction LR
-        R["raw<br/>lignes brutes"] -->|parser| S["stg<br/>date, IP, user, type"]
-        S -->|modéliser| M["mart<br/>modèle en étoile"]
-        M -->|interroger| D["5 détections SQL<br/>liées à ATT&CK"]
-    end
-    B -->|INSERT idempotent| R
-    D -->|générer| E["Rapport<br/>reports/report.md"]
+```
+OpenSSH_2k.log ──> load_raw.py ──> raw.auth_lines ──> load_stg.py ──> stg.auth_events ──> mart (à faire) ──> détections (à faire)
 ```
 
-| Couche | Rôle | État |
+Tout tourne dans PostgreSQL 16 sous Docker, sur le port **5433**.
+
+| Couche | Ce qu'il y a dedans | État |
 | --- | --- | --- |
-| `raw` | Copie exacte de chaque ligne du fichier, jamais modifiée | Fait |
-| `stg` | Ligne découpée et typée : horodatage, IP, utilisateur, type d'événement | À venir |
-| `mart` | Modèle en étoile : `fact_auth_event`, `dim_ip`, `dim_user` | À venir |
-| Détections | Vues SQL qui produisent les alertes | À venir |
+| `raw` | Chaque ligne du fichier telle quelle, jamais modifiée | fait |
+| `stg` | La ligne découpée : date, hôte, PID, type d'événement, user, IP, port... | fait |
+| `mart` | Modèle en étoile : `fact_auth_event`, `dim_ip`, `dim_user` | à faire |
+| détections | Des vues SQL qui sortent les alertes | à faire |
+
+Pourquoi garder `raw` : si mon parser a un bug, je le corrige et je relance `load_stg.py`, pas besoin de recharger le fichier.
 
 ---
 
-## Données
+## Relancer le projet
 
-Le jeu de données est le fichier **OpenSSH** de [Loghub](https://github.com/logpai/loghub), de vrais logs d'un serveur SSH exposé à Internet : **2000 lignes**.
+Il faut Docker Desktop (lancé, sinon erreur `dockerDesktopLinuxEngine`), Python 3.13 et Git Bash.
 
-Exemple de lignes :
+```bash
+docker compose up -d
+
+python -m venv .venv
+source .venv/Scripts/activate        # sous Linux : source .venv/bin/activate
+pip install -r requirements.txt
+
+# les logs (pas dans git)
+mkdir -p data/raw
+curl -L -o data/raw/OpenSSH_2k.log https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log
+
+python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log   # -> 2000 lignes chargées
+python src/sentinel/load_stg.py                           # -> 2000 lignes traitées, 0 non reconnue
+pytest                                                    # 32 tests
+```
+
+Vérifier dans la base :
+
+```bash
+docker compose exec db psql -U sentinel -c "SELECT count(*) FROM raw.auth_lines;"
+docker compose exec db psql -U sentinel -c "SELECT event_type, count(*) FROM stg.auth_events GROUP BY 1 ORDER BY 2 DESC;"
+```
+
+**Attention :** les scripts de `sql/` ne s'exécutent qu'au tout premier démarrage de la base. Si j'ajoute un fichier SQL et que la base existe déjà, il faut le lancer à la main :
+
+```bash
+docker compose exec -T db psql -U sentinel < sql/002_stg.sql
+```
+
+Ou repartir de zéro avec `docker compose down -v` (ça efface les données).
+
+---
+
+## Les données
+
+Fichier OpenSSH de [Loghub](https://github.com/logpai/loghub) : 2000 lignes de vrais logs d'un serveur SSH exposé sur Internet, toutes du 10 décembre. Le dossier `data/` est dans le `.gitignore`.
 
 ```
 Dec 10 06:55:46 LabSZ sshd[24200]: Invalid user webmaster from 173.234.31.186
 Dec 10 09:32:20 LabSZ sshd[24680]: Accepted password for fztu from 119.137.62.142 port 49116 ssh2
 ```
 
-Les données ne sont pas versionnées (`data/` est dans `.gitignore`) : voir [Lancer le projet](#lancer-le-projet) pour les télécharger.
-
 ---
 
-## Analyse exploratoire
+## Ce que j'ai vu en analysant les logs à la main
 
-Avant d'écrire du code, j'ai analysé les logs à la main avec les outils Unix (`grep`, `cut`, `sort`, `uniq`), comme le ferait un analyste SOC face à un nouveau jeu de données.
+Avant de coder j'ai regardé le fichier avec `grep`, `cut`, `sort`, `uniq` (à lancer dans Git Bash, pas PowerShell).
 
-### 1. Une seule connexion réussie
-
-```bash
-grep -c "Accepted password" data/raw/OpenSSH_2k.log
-# 1
-```
-
-Une seule connexion acceptée sur 2000 lignes, face à des centaines d'échecs : le serveur subit des tentatives de connexion massives.
-
-**Cette connexion est-elle suspecte ?** L'IP `119.137.62.142` n'a **aucun** échec de mot de passe dans le fichier. On voit seulement la connexion de l'utilisateur `fztu` à 09:32:20, puis une déconnexion normale (`disconnected by user`) à 09:45:06. Rien n'indique une compromission dans ces données.
-
-Limite : l'absence d'échecs ne prouve pas la légitimité. Un attaquant possédant un mot de passe volé réussirait du premier coup. La détection D3 vise justement l'inverse : une connexion réussie **précédée** de nombreux échecs depuis la même IP.
-
-### 2. Les IP les plus agressives
+**Une seule connexion réussie** sur 2000 lignes :
 
 ```bash
-grep "Failed password" data/raw/OpenSSH_2k.log \
-  | grep -oE "from [0-9.]+" | cut -d' ' -f2 \
-  | sort | uniq -c | sort -rn | head -5
+grep -c "Accepted password" data/raw/OpenSSH_2k.log   # 1
 ```
 
-| Rang | IP source | Échecs de mot de passe |
-| --- | --- | --- |
-| 1 | 183.62.140.253 | 286 |
-| 2 | 187.141.143.180 | 80 |
-| 3 | 103.99.0.122 | 46 |
-| 4 | 112.95.230.3 | 26 |
-| 5 | 5.188.10.180 | 18 |
+C'est `fztu` depuis `119.137.62.142` à 09:32:20, déconnexion normale à 09:45:06. Cette IP n'a aucun échec avant, donc rien de suspect dans ces données. Mais pas d'échec ne veut pas dire légitime : quelqu'un avec un mot de passe volé passe du premier coup. La détection D3 cherche l'inverse (succès après plein d'échecs).
 
-- **520** échecs de mot de passe au total, venant de **23** IP différentes.
-- La première IP en génère **55 %** à elle seule, les deux premières environ 70 %.
-- Quelques sources concentrent l'essentiel des tentatives : c'est la signature d'un **brute force** (MITRE ATT&CK T1110).
-
-### 3. Les types de messages, et la leçon pour le parser
+**Les IP qui attaquent le plus :**
 
 ```bash
-cut -d: -f4- data/raw/OpenSSH_2k.log | cut -c1-40 | sort | uniq -c | sort -rn | head -5
+grep "Failed password" data/raw/OpenSSH_2k.log | grep -oE "from [0-9.]+" | cut -d' ' -f2 | sort | uniq -c | sort -rn | head -5
 ```
 
-| Occurrences | Début du message |
+| IP | Échecs |
 | --- | --- |
-| 494 | `pam_unix(sshd:auth): authentication fai...` |
-| 285 | `Received disconnect from 183.62.140.253` |
-| 276 | `Failed password for root from 183.62.14...` |
-| 135 | `pam_unix(sshd:auth): check pass; user u...` |
-| 85 | `reverse mapping checking getaddrinfo fo...` |
+| 183.62.140.253 | 286 |
+| 187.141.143.180 | 80 |
+| 103.99.0.122 | 46 |
+| 112.95.230.3 | 26 |
+| 5.188.10.180 | 18 |
 
-Ce que ce résultat apprend :
+23 IP en tout, la première fait 55 % des échecs à elle seule. Peu de sources qui concentrent tout = brute force (T1110).
 
-- **Une tentative produit plusieurs lignes** : SSH écrit `Failed password`, le module système PAM écrit `authentication failure`. Compter des lignes n'est pas compter des attaques.
-- **Couper le texte à longueur fixe est trompeur** : la coupure à 40 caractères tronque les IP et fusionne des sources différentes (`183.62.14...`), tandis que les parties variables (IP, utilisateur, port) séparent des événements du même type.
-
-**Conclusion :** il faut extraire chaque champ séparément avec des expressions régulières. C'est le rôle du parser (étape suivante).
+**Une tentative = plusieurs lignes.** SSH écrit `Failed password`, PAM écrit `authentication failure`. Compter les lignes ne revient pas à compter les attaques. Et couper le texte à longueur fixe (`cut -c1-40`) tronque les IP. D'où le parser avec une regex par champ.
 
 ---
 
-## Choix techniques
+## Le parser
 
-| Choix | Pourquoi |
-| --- | --- |
-| **PostgreSQL** | Base relationnelle robuste, fonctions de fenêtrage (`OVER ... RANGE INTERVAL`) idéales pour détecter « N échecs en 5 minutes ». |
-| **Docker Compose** | Toute la base se lance en une commande, sans rien installer, de façon identique sur n'importe quelle machine. |
-| **Trois couches `raw`, `stg`, `mart`** | `raw` conserve la donnée d'origine intacte : si le parser a un bug, on le corrige et on rejoue le traitement sans recharger les fichiers. |
-| **Chargement et parsing séparés** | `load_raw.py` copie sans interpréter, `parser.py` interprète. Une responsabilité par fichier, donc plus simple à tester et à corriger. |
-| **Requêtes paramétrées (`%s`)** | Les valeurs ne sont jamais collées dans le SQL : protection contre l'injection SQL. |
+`parser.py` ne touche pas à la base : il prend une ligne, il renvoie un objet. Comme ça je le teste avec pytest sans PostgreSQL. Une regex pour l'en-tête syslog (date, hôte, processus, PID), puis une liste de regex pour le message : la première qui matche donne le type.
 
----
+Résultat sur le fichier : 2000 lignes reconnues, 16 types.
 
-## Problèmes rencontrés et solutions
-
-| Problème | Cause | Solution |
+| Type | Lignes | Message |
 | --- | --- | --- |
-| `services.ports must be a mapping` | Indentation YAML incorrecte dans `docker-compose.yml` | Réindentation : `ports` et `volumes` au même niveau que `image` |
-| `failed to bind host port 0.0.0.0:5432: address already in use` | Un PostgreSQL local occupait déjà le port 5432 | Exposition du conteneur sur le port **5433** (`"5433:5432"`) |
-| Conteneur arrêté aussitôt, `Permission denied` sur `/docker-entrypoint-initdb.d/` | **SELinux** (Fedora) interdit au conteneur de lire le dossier monté | Suffixe `:Z` sur le volume : `./sql:/docker-entrypoint-initdb.d:Z` |
-| Une deuxième exécution du chargement donnait **4000** lignes au lieu de 2000 | Aucune règle n'empêchait d'insérer deux fois la même ligne | Chargement **idempotent** (voir ci-dessous) |
+| `auth_failure` | 524 | `Failed password for root from ... port ... ssh2` |
+| `pam_auth_failure` | 494 | `pam_unix(sshd:auth): authentication failure; ... rhost=...` |
+| `disconnect` | 468 | `Received disconnect from ...: 11: Bye Bye` |
+| `pam_unknown_user` | 135 | `check pass; user unknown` |
+| `invalid_user` | 113 | `Invalid user webmaster from ...` |
+| `invalid_user_request` | 113 | `input_userauth_request: invalid user webmaster` |
+| `reverse_mapping_failed` | 85 | `reverse mapping checking getaddrinfo ... POSSIBLE BREAK-IN ATTEMPT!` |
+| `connection_closed` | 34 | `Connection closed by ...` |
+| les 8 autres | 34 | succès, sessions, `Too many authentication failures`, `fatal`... |
 
-### Le chargement idempotent
+Les pièges que j'ai dû gérer :
 
-Un script idempotent peut être relancé autant de fois qu'on veut : le résultat est le même qu'après une seule exécution. Sans cela, chaque ligne serait comptée deux fois et toutes les détections seraient faussées (une IP aurait deux fois plus d'échecs).
-
-Deux mécanismes combinés :
-
-1. Une **contrainte d'unicité** sur le couple (fichier, numéro de ligne) :
-   ```sql
-   CONSTRAINT auth_lines_uniq UNIQUE (source_file, line_no)
-   ```
-2. Une insertion qui **ignore** les lignes déjà présentes :
-   ```sql
-   INSERT INTO raw.auth_lines (line_no, line, source_file)
-   VALUES (%s, %s, %s)
-   ON CONFLICT (source_file, line_no) DO NOTHING
-   ```
-
-Résultat attendu : la première exécution insère 2000 lignes, la seconde en insère 0, et la table en contient toujours 2000.
+- **`message repeated 5 times: [ Failed password ... ]`** : syslog regroupe les messages identiques, une ligne = 5 échecs. Je garde le nombre dans `repeat_count`. Au final **528 vraies tentatives** pour 520 lignes, mon `grep` sous-estimait.
+- **Les noms d'utilisateur viennent de l'attaquant**, il peut y avoir des espaces (`invalid user  0101`). La regex prend tout jusqu'à ` from ` au lieu de `\S+`.
+- **Pas d'année ni de fuseau dans syslog** (`Dec 10 06:55:46`). Par défaut je prends l'année de la date d'ingestion, et si ça tombe dans le futur je recule d'un an (même règle que rsyslog / Logstash). Lu en novembre 2026, ça donne décembre 2025. `--year 2017` force l'année, `--tz Europe/Paris` change le fuseau (UTC par défaut).
+- **Les mois** : je passe par un dictionnaire et pas `strptime("%b")`, qui dépend de la langue du système. Sur mon Windows en français, `Dec` ne serait pas reconnu.
 
 ---
 
-## Structure du dépôt
+## Pourquoi j'ai fait ces choix
+
+- **PostgreSQL** : les fonctions de fenêtrage (`OVER ... RANGE INTERVAL`) sont parfaites pour « N échecs en 5 minutes ».
+- **Docker Compose** : la base se lance en une commande, pareil sur n'importe quelle machine.
+- **Chargement et parsing séparés** : `load_raw.py` copie, `parser.py` interprète. Un fichier = une responsabilité, plus simple à tester.
+- **Requêtes paramétrées (`%s`)** : jamais de valeur collée dans le SQL, pas d'injection.
+- **`raw` en `DO NOTHING`, `stg` en `DO UPDATE`** : dans `raw` une ligne déjà là est ignorée. Dans `stg` elle est mise à jour, comme ça si je corrige le parser je relance et `stg` est corrigé.
+- **Type `inet` pour les IP** : PostgreSQL valide l'adresse, et je peux chercher par sous-réseau (`src_ip << '183.62.0.0/16'`).
+
+---
+
+## Galères et solutions
+
+| Problème | Cause | Ce que j'ai fait |
+| --- | --- | --- |
+| `services.ports must be a mapping` | Mauvaise indentation YAML | `ports` et `volumes` au même niveau que `image` |
+| `address already in use` sur 5432 | Un PostgreSQL local tournait déjà (Fedora) | Conteneur exposé sur **5433** |
+| Conteneur qui s'arrête, `Permission denied` sur `/docker-entrypoint-initdb.d/` | SELinux sur Fedora bloque le dossier monté | `:Z` à la fin du volume. Sous Windows Docker l'ignore |
+| 4000 lignes au 2e chargement au lieu de 2000 | Rien n'empêchait les doublons | `UNIQUE (source_file, line_no)` + `ON CONFLICT DO NOTHING` |
+| `failed to connect to the docker API ... dockerDesktopLinuxEngine` | Docker Desktop pas lancé | Ouvrir Docker Desktop et attendre « Engine running » |
+| `py -3.13` : `No suitable Python runtime found` | Python 3.13 pas installé, j'avais que la 3.15 | `winget install Python.Python.3.13` puis recréer le venv |
+| Fichier téléchargé nommé `datarawOpenSSH_2k.log` | J'ai tapé `data\raw\...` dans Git Bash, les `\` sont des échappements en bash | Toujours `/` dans Git Bash |
+| `relation "stg.auth_events" does not exist` | La base existait avant `002_stg.sql`, il n'a pas été lancé | `docker compose exec -T db psql -U sentinel < sql/002_stg.sql` |
+
+**L'idempotence**, pour m'en souvenir : un script idempotent peut être relancé autant de fois que je veux, le résultat est le même qu'après une seule fois. Sans ça chaque ligne compte double et toutes les détections sont faussées. 1re exécution : 2000 insérées. 2e : 0. La table reste à 2000.
+
+---
+
+## Fichiers
 
 ```
 ssh-sentinel/
 ├── docker-compose.yml        # PostgreSQL 16, port 5433
+├── requirements.txt          # psycopg, tzdata, pytest
+├── pyproject.toml            # config pytest (src/ dans le path)
 ├── sql/
-│   └── 001_schemas.sql       # schémas raw, stg, mart + table raw.auth_lines
+│   ├── 001_schemas.sql       # schémas raw, stg, mart + raw.auth_lines
+│   └── 002_stg.sql           # stg.auth_events
 ├── src/sentinel/
-│   └── load_raw.py           # fichier de log -> raw.auth_lines (idempotent)
-├── tests/
-├── data/raw/                 # logs téléchargés (non versionnés)
-└── README.md
+│   ├── load_raw.py           # fichier -> raw.auth_lines
+│   ├── parser.py             # ligne -> champs (regex, sans base)
+│   └── load_stg.py           # raw -> stg.auth_events
+├── tests/test_parser.py      # 32 tests
+└── data/raw/                 # logs, pas dans git
 ```
 
 ---
 
-## Lancer le projet
+## Ce qu'il reste à faire
 
-Prérequis : Git, Docker avec Docker Compose, Python 3.11 ou plus.
-
-```bash
-# 1. Cloner et entrer dans le dépôt
-git clone https://github.com/Windyam-Juste-Yannel-BELEMSIGRI/ssh-sentinel.git
-cd ssh-sentinel
-
-# 2. Démarrer PostgreSQL (les schémas sont créés au premier démarrage)
-docker compose up -d
-
-# 3. Environnement Python
-python3 -m venv .venv
-source .venv/bin/activate
-pip install "psycopg[binary]" pytest
-
-# 4. Télécharger les logs
-mkdir -p data/raw
-curl -L -o data/raw/OpenSSH_2k.log \
-  https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log
-
-# 5. Charger les lignes brutes
-python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log
-
-# 6. Vérifier
-docker compose exec db psql -U sentinel -c 'SELECT count(*) FROM raw.auth_lines;'
-```
-
-> Sur Fedora ou toute distribution avec SELinux, gardez le suffixe `:Z` sur le volume dans `docker-compose.yml`.
-
----
-
-## Feuille de route
-
-- [x] Environnement : dépôt, PostgreSQL dans Docker, schémas `raw`, `stg`, `mart`
-- [x] Analyse exploratoire des logs avec les outils Unix
-- [x] Chargement des lignes brutes dans `raw.auth_lines`
-- [x] Chargement idempotent (contrainte d'unicité + `ON CONFLICT DO NOTHING`)
-- [ ] Parser : extraction des champs avec des expressions régulières, tests `pytest`
-- [ ] Gestion de l'année et du fuseau horaire, absents des logs syslog
+- [x] Docker + PostgreSQL, schémas `raw`, `stg`, `mart`
+- [x] Analyse à la main avec les outils Unix
+- [x] Chargement brut idempotent
+- [x] Parser regex + tests pytest
+- [x] Année et fuseau horaire
 - [ ] Modèle en étoile dans `mart`
-- [ ] Comparaison de performance `INSERT` contre `COPY` sur le jeu complet (655 000 lignes environ)
-- [ ] Les 5 détections SQL :
+- [ ] Comparer `INSERT` et `COPY` sur le jeu complet (~655 000 lignes)
+- [ ] Les 5 détections :
 
-| # | Détection | Règle de départ | MITRE ATT&CK |
+| # | Détection | Règle de départ | ATT&CK |
 | --- | --- | --- | --- |
-| D1 | Brute force | 10 échecs ou plus depuis une IP en 5 minutes | T1110.001 |
-| D2 | Password spraying | Une IP essaie 5 comptes distincts ou plus en 10 minutes | T1110.003 |
-| D3 | Succès après échecs | Connexion réussie après 5 échecs ou plus de la même IP en 30 minutes | T1078 |
-| D4 | Énumération de comptes | Une IP teste 20 noms d'utilisateurs inexistants ou plus | T1110 |
-| D5 | Ciblage de root | Toute tentative sur le compte root, regroupée par IP | T1110 |
+| D1 | Brute force | 10 échecs ou plus depuis une IP en 5 min | T1110.001 |
+| D2 | Password spraying | 5 comptes distincts ou plus depuis une IP en 10 min | T1110.003 |
+| D3 | Succès après échecs | Connexion réussie après 5 échecs de la même IP en 30 min | T1078 |
+| D4 | Énumération de comptes | 20 users inexistants ou plus depuis une IP | T1110 |
+| D5 | Ciblage de root | Toute tentative sur root, groupée par IP | T1110 |
 
-- [ ] Attaque simulée (Hydra, entre mes propres machines virtuelles) et vérification que D1 et D3 se déclenchent
-- [ ] Rapport généré automatiquement
+Pour les compteurs d'échecs, penser à faire `sum(repeat_count)` et pas `count(*)`.
 
----
-
-## Ce que j'apprends avec ce projet
-
-- **Data Engineering** : conteneurisation d'une base, modélisation en couches, idempotence, requêtes paramétrées.
-- **SOC** : lecture des logs d'authentification Linux, repérage du brute force, prudence dans l'interprétation d'une connexion réussie.
-- **Linux** : diagnostic de conflits de ports et de SELinux, chaînes de commandes Unix pour l'analyse rapide.
-
-
+- [ ] Attaque simulée avec Hydra entre mes propres VM, vérifier que D1 et D3 sonnent
+- [ ] Rapport généré automatiquement (`reports/report.md`)
