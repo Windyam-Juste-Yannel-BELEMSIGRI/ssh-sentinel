@@ -5,7 +5,7 @@ un objet Python. C'est ce qui le rend simple à tester avec pytest.
 
 Exemple de ligne :
     Dec 10 09:32:20 LabSZ sshd[24680]: Accepted password for fztu from 119.137.62.142 port 49116 ssh2
-    └──── date ────┘ └hôte┘ └proc┘└pid┘ └──────────────────── message ─────────────────────────────┘
+   └───── date ────┘└hôte┘└proc┘└pid┘ └───────────────────────── message ─────────────────────────────┘
 """
 
 from __future__ import annotations
