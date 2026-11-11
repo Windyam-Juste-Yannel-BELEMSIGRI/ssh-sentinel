@@ -14,7 +14,9 @@ OpenSSH_2k.log ──> load_raw.py ──> raw.auth_lines
                                           │
                                      load_stg.py ──> stg.auth_events
                                                            │
-                                                     load_mart.py ──> mart (dim_ip, dim_user, fact_auth_event) ──> détections (à faire)
+                                                     load_mart.py ──> mart (dim_ip, dim_user, fact_auth_event)
+                                                                                 │
+                                                                            detect.py ──> detect (vues D1 à D5 + detect.alerts)
 ```
 
 Tout tourne dans PostgreSQL 16 sous Docker, sur le port **5433**.
@@ -24,7 +26,7 @@ Tout tourne dans PostgreSQL 16 sous Docker, sur le port **5433**.
 | `raw` | Chaque ligne du fichier telle quelle, jamais modifiée | fait |
 | `stg` | La ligne découpée : date, hôte, PID, type d'événement, user, IP, port... | fait |
 | `mart` | Modèle en étoile : `fact_auth_event`, `dim_ip`, `dim_user` | fait |
-| détections | Des vues SQL qui sortent les alertes | à faire |
+| `detect` | Des vues SQL qui sortent les alertes (D1 à D5) | fait |
 
 Pourquoi garder `raw` : si mon parser a un bug, je le corrige et je relance `load_stg.py`, pas besoin de recharger le fichier.
 
@@ -48,7 +50,8 @@ curl -L -o data/raw/OpenSSH_2k.log https://raw.githubusercontent.com/logpai/logh
 python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log   # -> 2000 lignes chargées
 python src/sentinel/load_stg.py                           # -> 2000 lignes traitées, 0 non reconnue
 python src/sentinel/load_mart.py                          # -> 30 IP, 64 users, 638 événements
-pytest                                                    # 40 tests (les 8 de test_mart.py ont besoin de la base)
+python src/sentinel/detect.py                             # -> 23 alertes
+pytest                                                    # 60 tests (test_mart.py et test_detections.py ont besoin de la base)
 ```
 
 Vérifier dans la base :
@@ -57,6 +60,7 @@ Vérifier dans la base :
 docker compose exec db psql -U sentinel -c "SELECT count(*) FROM raw.auth_lines;"
 docker compose exec db psql -U sentinel -c "SELECT event_type, count(*) FROM stg.auth_events GROUP BY 1 ORDER BY 2 DESC;"
 docker compose exec db psql -U sentinel -c "SELECT event_type, count(*), sum(attempts) FROM mart.fact_auth_event GROUP BY 1;"
+docker compose exec db psql -U sentinel -c "SELECT detection, severity, host(src_ip), detail FROM detect.alerts;"
 ```
 
 **Attention :** les scripts de `sql/` ne s'exécutent qu'au tout premier démarrage de la base. Si j'ajoute un fichier SQL et que la base existe déjà, il faut le lancer à la main :
@@ -67,7 +71,7 @@ docker compose exec -T db psql -U sentinel < sql/002_stg.sql
 
 Ou repartir de zéro avec `docker compose down -v` (ça efface les données).
 
-Pour `003_mart.sql` je n'ai plus ce problème : `load_mart.py` lance lui-même le fichier avant de charger (tout est en `IF NOT EXISTS`).
+Pour `003_mart.sql` et `004_detections.sql` je n'ai plus ce problème : `load_mart.py` et `detect.py` lancent eux-mêmes leur fichier (tables en `IF NOT EXISTS`, vues recréées à chaque fois).
 
 ---
 
@@ -190,11 +194,46 @@ Résultat : 7 comptes qui existent (`root`, `fztu`, `ftp`, `git`, `mysql`, `sshd
 
 L'ordre compte : les faits ont besoin des clés des dimensions. Relancé deux fois, rien ne bouge (testé).
 
-**Premiers essais des détections**, pour vérifier que le modèle tient (les vraies vues restent à écrire) :
+**Premiers essais des détections**, pour vérifier que le modèle tient (les vues sont dans la section suivante) :
 - D1 : 6 IP dépassent 10 échecs en 5 min. `183.62.140.253` monte à **147 en 5 min**.
 - D4 : `187.141.143.180` a essayé **24 comptes inexistants**, `103.99.0.122` en a essayé 15.
 - D5 : `183.62.140.253` a fait 276 tentatives sur root. Elle ne vise presque que root, alors que `187.141.143.180` essaie plein de noms : deux façons d'attaquer différentes.
 - D3 : la seule connexion réussie (`fztu`) n'a eu aucun échec dans les 30 min avant. Ça confirme ce que j'avais vu à la main.
+
+---
+
+## Les détections (`detect`)
+
+`sql/004_detections.sql` crée un schéma `detect` qui ne contient **que des vues** : aucune donnée n'y est stockée, donc le fichier commence par `DROP SCHEMA detect CASCADE` et recrée tout. Comme ça je peux changer les colonnes d'une vue sans me battre avec `CREATE OR REPLACE VIEW` (qui refuse). `detect.py` lance le fichier puis affiche les alertes.
+
+| # | Vue | Règle | ATT&CK | Gravité | Alertes |
+| --- | --- | --- | --- | --- | --- |
+| D1 | `d1_brute_force` | 10 mots de passe ratés ou plus depuis une IP en 5 min | T1110.001 | high | 7 (6 IP) |
+| D2 | `d2_password_spraying` | 5 comptes distincts ou plus depuis une IP en 10 min | T1110.003 | medium | 5 (4 IP) |
+| D3 | `d3_success_after_failures` | Connexion réussie après 5 échecs de la même IP en 30 min | T1078 | critical | 0 |
+| D4 | `d4_user_enumeration` | 20 comptes inexistants ou plus depuis une IP | T1110 | medium | 1 |
+| D5 | `d5_root_targeting` | Toute tentative sur root, par IP | T1110 | low → critical | 10 |
+
+`detect.alerts` met les 5 vues au même format (détection, technique, gravité, IP, user, début, fin, score, détail en français). C'est elle que lira le rapport.
+
+**Comment ça marche :**
+
+- **D1** : `sum(attempts) OVER (PARTITION BY ip ORDER BY event_ts RANGE BETWEEN '5 minutes' PRECEDING AND CURRENT ROW)`. `RANGE` et pas `ROWS` : la fenêtre est en temps, pas en nombre de lignes. Seulement `auth_method = 'password'` (pas les sondes `none`).
+- **Épisodes** : sans ça, une IP qui fait 286 échecs donnerait des centaines d'alertes (une par ligne au-dessus du seuil). Je regroupe les déclenchements : nouvel épisode si plus de 5 min séparent deux déclenchements (technique *gaps and islands* : `lag()` puis somme cumulée). `103.99.0.122` attaque deux fois à 2 h d'écart → 2 alertes.
+- **D2** : PostgreSQL ne sait pas faire `count(DISTINCT ...)` en fonction de fenêtre. Je passe par un `LATERAL` qui compte, pour chaque événement, les comptes distincts de la même IP dans les 10 min d'avant. Je prends les `auth_failure` et les `invalid_user` (distincts, donc pas de double compte).
+- **D3** : pour chaque `auth_success`, un `LATERAL` additionne les échecs de la même IP dans les 30 min d'avant. `same_user_failed` dit si le compte qui a réussi faisait partie des comptes ratés (mot de passe deviné) ou pas (l'attaquant a peut-être un autre accès).
+- **D4** : pas de fenêtre, toute la période. Repose sur `dim_user.account_exists = false`.
+- **D5** : seuil à 1. `root_ratio` = part des échecs de l'IP qui visent root. Gravité `critical` s'il y a un succès sur root, `medium` à partir de 10 échecs, `low` sinon.
+
+**Ce que ça donne sur le fichier :** 23 alertes. Les 4 grosses IP de mon analyse à la main sont toutes là. `187.141.143.180` sonne sur D1, D2, D4 et D5 : c'est l'IP la plus complète (et celle qui a un DNS inverse faux). D3 ne sonne pas, comme prévu (`fztu` n'a aucun échec avant).
+
+**Limites que j'ai vues :**
+
+- **D1 et D2 se recoupent** : un brute force sur une liste de noms coche les deux. Normal, c'est le même attaquant vu sous deux angles. Le rapport devra regrouper par IP.
+- **`183.62.140.253` sort en D2** (10 comptes en 10 min) alors que 97 % de ses essais visent root : c'est du brute force, pas du spraying. Sans les mots de passe dans les logs, je ne peux pas voir le vrai spraying (« un mot de passe, plein de comptes »). On pourrait exiger un `root_ratio` faible pour D2, à voir avec plus de données.
+- Les seuils sont en dur dans une CTE `params` au début de chaque vue. Pour les régler il faut modifier le SQL.
+
+**Les tests** (`test_detections.py`, 20 tests) : 6 sur les vraies données (les chiffres du README) et 14 sur des événements **fictifs**. Ceux-là insèrent une IP de documentation (`198.51.100.7`, RFC 5737) et des faits, lisent la vue, puis font un `rollback` : la base n'est jamais modifiée. C'est comme ça que je teste D3 (qui ne sonne pas sur le fichier) et les effets de seuil : 9 échecs ne sonnent pas, 10 oui ; 2 lignes `repeated 5 times` sonnent ; 10 échecs étalés sur 10 min ne sonnent pas ; 4 échecs avant un succès non, 5 oui ; échecs 40 min avant le succès non.
 
 ---
 
@@ -240,15 +279,18 @@ ssh-sentinel/
 ├── sql/
 │   ├── 001_schemas.sql       # schémas raw, stg, mart + raw.auth_lines
 │   ├── 002_stg.sql           # stg.auth_events
-│   └── 003_mart.sql          # dim_ip, dim_user, fact_auth_event
+│   ├── 003_mart.sql          # dim_ip, dim_user, fact_auth_event
+│   └── 004_detections.sql    # vues D1 à D5 + detect.alerts
 ├── src/sentinel/
 │   ├── load_raw.py           # fichier -> raw.auth_lines
 │   ├── parser.py             # ligne -> champs (regex, sans base)
 │   ├── load_stg.py           # raw -> stg.auth_events
-│   └── load_mart.py          # stg -> mart (SQL, une transaction)
+│   ├── load_mart.py          # stg -> mart (SQL, une transaction)
+│   └── detect.py             # crée les vues et affiche les alertes
 ├── tests/
 │   ├── test_parser.py        # 32 tests, sans base
-│   └── test_mart.py          # 8 tests, avec la base (ignorés si elle est éteinte)
+│   ├── test_mart.py          # 8 tests, avec la base (ignorés si elle est éteinte)
+│   └── test_detections.py    # 20 tests, avec la base (faux événements annulés par rollback)
 └── data/raw/                 # logs, pas dans git
 ```
 
@@ -263,7 +305,7 @@ ssh-sentinel/
 - [x] Année et fuseau horaire
 - [x] Modèle en étoile dans `mart` + tests
 - [ ] Comparer `INSERT` et `COPY` sur le jeu complet (~655 000 lignes)
-- [ ] Les 5 détections :
+- [x] Les 5 détections (voir la section `detect`) :
 
 | # | Détection | Règle de départ | ATT&CK |
 | --- | --- | --- | --- |
@@ -273,7 +315,7 @@ ssh-sentinel/
 | D4 | Énumération de comptes | 20 users inexistants ou plus depuis une IP | T1110 |
 | D5 | Ciblage de root | Toute tentative sur root, groupée par IP | T1110 |
 
-Les écrire en vues SQL sur `mart` (`sql/004_detections.sql`). Pour les compteurs d'échecs : `sum(attempts)` et pas `count(*)`. Les requêtes d'essai de la section `mart` sont un bon point de départ.
+Écrites en vues SQL dans `sql/004_detections.sql`, testées avec des faux événements.
 
 - [ ] Attaque simulée avec Hydra entre mes propres VM, vérifier que D1 et D3 sonnent
-- [ ] Rapport généré automatiquement (`reports/report.md`)
+- [ ] Rapport généré automatiquement (`reports/report.md`) à partir de `detect.alerts`, regroupé par IP
