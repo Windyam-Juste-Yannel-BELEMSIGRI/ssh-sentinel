@@ -1,5 +1,5 @@
-"""Tests du modèle en étoile. Contrairement à test_parser.py, ils ont besoin de la
-base (docker compose up -d) avec raw et stg déjà chargés. Sinon ils sont ignorés."""
+"""Tests du modèle en étoile. Il faut la base (docker compose up -d) avec raw et
+stg déjà chargés, sinon ils sont sautés."""
 
 import psycopg
 import pytest
@@ -44,12 +44,12 @@ def test_fact_a_une_ligne_par_evenement_stg_retenu(cur):
 
 
 def test_pas_de_lignes_pam_dans_les_faits(cur):
-    # Sinon chaque tentative compterait double (ligne sshd + ligne PAM).
+    # sinon chaque tentative compte deux fois (la ligne sshd + la ligne PAM)
     assert scalar(cur, "SELECT count(*) FROM mart.fact_auth_event WHERE event_type LIKE 'pam%'") == 0
 
 
 def test_les_tentatives_repetees_sont_comptees(cur):
-    # "message repeated 5 times" doit valoir 5 dans attempts.
+    # "message repeated 5 times" doit valoir 5, pas 1
     stg = scalar(cur, "SELECT sum(repeat_count) FROM stg.auth_events WHERE event_type = 'auth_failure'")
     mart = scalar(cur, "SELECT sum(attempts) FROM mart.fact_auth_event WHERE event_type = 'auth_failure'")
     assert mart == stg

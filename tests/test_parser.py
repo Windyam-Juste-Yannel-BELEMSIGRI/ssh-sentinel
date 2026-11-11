@@ -1,5 +1,5 @@
-"""Tests du parser : une ligne réelle du jeu de données par type d'événement,
-plus les cas pièges repérés pendant l'analyse exploratoire."""
+"""Tests du parser. Une vraie ligne du fichier par type d'événement, et les
+pièges que j'ai trouvés en regardant les logs à la main."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +11,7 @@ from sentinel.parser import parse_line, resolve_timestamp
 DATA_FILE = Path(__file__).resolve().parents[1] / "data" / "raw" / "OpenSSH_2k.log"
 
 
-# --- En-tête syslog -------------------------------------------------------
+# l'en-tête syslog
 
 def test_header():
     ev = parse_line("Dec 10 06:55:46 LabSZ sshd[24200]: Invalid user webmaster from 173.234.31.186")
@@ -34,7 +34,7 @@ def test_ligne_hors_format():
     assert parse_line("ceci n'est pas un log") is None
 
 
-# --- Un test par type d'événement -----------------------------------------
+# un test par type d'événement
 
 @pytest.mark.parametrize("message, attendu", [
     ("Accepted password for fztu from 119.137.62.142 port 49116 ssh2",
@@ -89,7 +89,7 @@ def test_types_evenements(message, attendu):
         assert getattr(ev, champ) == valeur, champ
 
 
-# --- Cas pièges -----------------------------------------------------------
+# les pièges
 
 def test_message_repete_compte_plusieurs_echecs():
     ev = parse_line(
@@ -102,7 +102,7 @@ def test_message_repete_compte_plusieurs_echecs():
 
 
 def test_nom_utilisateur_avec_espace():
-    # Le nom est fourni par l'attaquant : il peut contenir des espaces.
+    # c'est l'attaquant qui choisit le nom, espaces compris
     ev = parse_line("Dec 10 06:55:46 LabSZ sshd[1]: Invalid user  0101 from 1.2.3.4")
     assert ev.username == " 0101"
     assert ev.src_ip == "1.2.3.4"
@@ -113,7 +113,7 @@ def test_message_inconnu():
     assert ev.event_type == "unknown"
 
 
-# --- Reconstitution de la date --------------------------------------------
+# l'année et le fuseau
 
 def _ev(month_day_time="Dec 10 06:55:46"):
     return parse_line(f"{month_day_time} LabSZ sshd[1]: Connection closed by 1.2.3.4")
@@ -130,7 +130,7 @@ def test_annee_deduite_meme_annee():
 
 
 def test_annee_deduite_date_future_recule_d_un_an():
-    # Lu le 2 novembre 2026, "Dec 10" ne peut pas être dans le futur : décembre 2025.
+    # lu le 2 novembre 2026, "Dec 10" ne peut être que décembre 2025
     ref = datetime(2026, 11, 2, tzinfo=timezone.utc)
     assert resolve_timestamp(_ev(), reference=ref).year == 2025
 
@@ -140,7 +140,7 @@ def test_29_fevrier_annee_non_bissextile():
     assert resolve_timestamp(_ev("Feb 29 10:00:00"), reference=ref, year=2026) is None
 
 
-# --- Sur le vrai fichier (ignoré s'il n'est pas téléchargé) ---------------
+# sur le vrai fichier, si je l'ai téléchargé
 
 @pytest.mark.skipif(not DATA_FILE.exists(), reason="data/raw/OpenSSH_2k.log absent")
 def test_toutes_les_lignes_du_jeu_de_donnees_sont_reconnues():

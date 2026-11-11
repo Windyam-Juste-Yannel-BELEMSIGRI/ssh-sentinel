@@ -1,11 +1,9 @@
-# Dépendances Python de ssh-sentinel
-# Installation : pip install -r requirements.txt
+# pip install -r requirements.txt
 
-# Pilote PostgreSQL (psycopg 3) ; [binary] embarque libpq, rien à compiler
+# psycopg 3, la version [binary] embarque libpq donc rien à compiler
 psycopg[binary]>=3.2,<4
 
-# Base des fuseaux horaires : Windows n'en fournit pas à Python (utilisée par --tz)
+# Windows n'a pas la base des fuseaux horaires, il en faut une pour --tz
 tzdata
 
-# Tests du parser et des détections
 pytest>=8,<10

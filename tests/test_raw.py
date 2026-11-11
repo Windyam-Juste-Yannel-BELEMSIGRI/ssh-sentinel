@@ -1,5 +1,5 @@
-"""Tests du chargement brut. Ont besoin de la base, sinon ils sont ignorés.
-Le fichier de test a un nom unique et ses lignes sont supprimées à la fin."""
+"""Tests du chargement brut (il faut la base). Le fichier de test a un nom à
+part et je supprime ses lignes à la fin."""
 
 import psycopg
 import pytest
@@ -41,7 +41,7 @@ def test_chargement_puis_relance(fichier, method):
 
 
 def test_copy_et_insert_se_completent(fichier):
-    # Une ligne déjà chargée par une méthode est ignorée par l'autre.
+    # ce qui est chargé par une méthode est ignoré par l'autre
     path, conn = fichier
     assert load(path, "insert") == 3
     assert load(path, "copy") == 0

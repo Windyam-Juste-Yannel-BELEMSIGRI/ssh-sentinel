@@ -1,23 +1,20 @@
--- Détections SOC sur le modèle en étoile (mart).
+-- Les détections, en vues sur mart.
 --
--- Le schéma detect ne contient QUE des vues : aucune donnée n'y est stockée.
--- On peut donc le supprimer et le recréer à chaque fois, ce qui rend le fichier
--- rejouable même si une vue change de colonnes (CREATE OR REPLACE VIEW refuse ça).
--- Ne jamais mettre de table dans ce schéma.
+-- Le schéma detect n'a que des vues, je le supprime et le recrée à chaque fois.
+-- Comme ça je peux changer les colonnes d'une vue (CREATE OR REPLACE VIEW refuse).
+-- Donc surtout pas de table ici.
 --
--- Règles communes :
--- - compter les tentatives avec sum(attempts), jamais count(*) :
---   une ligne "message repeated 5 times" vaut 5 ;
--- - les échecs "Failed none" sont des sondes du client SSH, pas des mots de
---   passe essayés : D1 et D3 ne gardent que auth_method = 'password'.
---
--- Les seuils sont écrits en dur au début de chaque vue (CTE params).
+-- À ne pas oublier :
+-- - les tentatives se comptent avec sum(attempts), pas count(*)
+--   ("message repeated 5 times" = 5) ;
+-- - "Failed none" ce sont des sondes du client, pas des mots de passe,
+--   donc D1 et D3 filtrent sur auth_method = 'password'.
+-- Les seuils sont dans la CTE params au début de chaque vue.
 
 DROP SCHEMA IF EXISTS detect CASCADE;
 CREATE SCHEMA detect;
 
--- Tous les faits avec l'IP et le nom en clair : évite de refaire les jointures
--- dans chaque détection.
+-- les faits avec l'IP et le nom en clair, pour ne pas refaire les jointures partout
 CREATE VIEW detect.auth_events AS
 SELECT
   f.source_file, f.line_no, f.event_ts, f.event_type, f.auth_method, f.attempts,
@@ -27,14 +24,12 @@ JOIN mart.dim_ip i ON i.ip_key = f.ip_key
 LEFT JOIN mart.dim_user u ON u.user_key = f.user_key;
 
 
--- D1 - Brute force (T1110.001)
--- 10 mots de passe ratés ou plus depuis une IP en 5 minutes.
+-- D1 brute force (T1110.001) : 10 mots de passe ratés ou plus en 5 min, même IP.
 --
--- Pour chaque échec on calcule la somme des tentatives de la même IP sur les
--- 5 minutes qui précèdent (fenêtre RANGE sur le temps, pas sur les lignes).
--- Les échecs qui dépassent le seuil sont ensuite regroupés en épisodes : un
--- nouvel épisode commence quand plus de 5 minutes séparent deux déclenchements.
--- Une IP qui attaque en continu donne donc une seule alerte, pas une par ligne.
+-- Pour chaque échec, la somme des tentatives de l'IP sur les 5 min d'avant
+-- (RANGE, donc une fenêtre en temps et pas en lignes). Ensuite je regroupe les
+-- déclenchements en épisodes, sinon une IP qui attaque pendant 10 min donne
+-- une alerte par ligne. Plus de 5 min entre deux déclenchements = nouvel épisode.
 CREATE VIEW detect.d1_brute_force AS
 WITH params AS (SELECT 10 AS threshold, interval '5 minutes' AS win),
 failures AS (
@@ -58,8 +53,7 @@ episodes AS (
   SELECT t.*, sum(t.new_episode) OVER (PARTITION BY t.ip_key ORDER BY t.event_ts) AS episode
   FROM triggers t
 ),
--- Un épisode couvre les échecs entre (1er déclenchement - 5 min) et le dernier
--- déclenchement : on y relit les vrais échecs pour avoir la vraie heure de début.
+-- je relis les échecs de l'épisode pour avoir la vraie heure de début
 grouped AS (
   SELECT ep.ip_key, ep.src_ip,
          min(ep.event_ts) - (SELECT win FROM params) AS span_start,
@@ -82,14 +76,12 @@ CROSS JOIN LATERAL (
 ) s;
 
 
--- D2 - Password spraying (T1110.003)
--- 5 comptes distincts ou plus essayés depuis une IP en 10 minutes.
+-- D2 password spraying (T1110.003) : 5 comptes différents ou plus en 10 min, même IP.
 --
--- Les logs ne contiennent pas les mots de passe : on ne peut pas voir "un même
--- mot de passe sur plein de comptes". On approche ça par "beaucoup de comptes
--- différents en peu de temps". Recoupe forcément un peu D4.
--- count(DISTINCT) n'existe pas en fonction de fenêtre dans PostgreSQL, d'où la
--- sous-requête LATERAL sur les 10 minutes qui précèdent chaque événement.
+-- Les mots de passe ne sont pas dans les logs, donc je ne peux pas voir le vrai
+-- spraying (un mot de passe sur plein de comptes). Je prends "beaucoup de
+-- comptes en peu de temps" à la place, ça recoupe un peu D4.
+-- Pas de count(DISTINCT) dans une fenêtre en PostgreSQL, d'où le LATERAL.
 CREATE VIEW detect.d2_password_spraying AS
 WITH params AS (SELECT 5 AS threshold, interval '10 minutes' AS win),
 attempts AS (
@@ -142,10 +134,9 @@ CROSS JOIN LATERAL (
 ) s;
 
 
--- D3 - Succès après échecs (T1078)
--- Une connexion réussie alors que la même IP a raté 5 mots de passe ou plus
--- dans les 30 minutes avant : le mot de passe a peut-être été trouvé.
--- C'est la détection la plus grave : D1 dit "on essaie", D3 dit "ça a marché".
+-- D3 succès après échecs (T1078) : une connexion qui réussit après au moins
+-- 5 échecs de la même IP dans les 30 min d'avant. Le mot de passe a peut-être
+-- été trouvé, c'est la plus grave des cinq.
 CREATE VIEW detect.d3_success_after_failures AS
 WITH params AS (SELECT 5 AS threshold, interval '30 minutes' AS win)
 SELECT
@@ -172,10 +163,9 @@ WHERE s.event_type = 'auth_success'
   AND p.failed_attempts >= (SELECT threshold FROM params);
 
 
--- D4 - Énumération de comptes (T1110)
--- 20 noms d'utilisateur inexistants ou plus essayés depuis une IP, sur toute
--- la période. L'attaquant teste une liste de noms (admin, test, oracle...)
--- pour trouver ceux qui existent. Repose sur dim_user.account_exists.
+-- D4 énumération de comptes (T1110) : 20 comptes inexistants ou plus depuis
+-- une IP, sur toute la période. L'attaquant essaie une liste de noms (admin,
+-- test, oracle...) pour voir lesquels existent. Ça repose sur account_exists.
 CREATE VIEW detect.d4_user_enumeration AS
 WITH params AS (SELECT 20 AS threshold)
 SELECT
@@ -190,11 +180,10 @@ GROUP BY e.ip_key, e.src_ip
 HAVING count(DISTINCT e.user_key) >= (SELECT threshold FROM params);
 
 
--- D5 - Ciblage de root (T1110)
--- Toute tentative sur root, groupée par IP. Seuil à 1 : sur un serveur bien
--- configuré (PermitRootLogin no) personne de légitime ne tente root par mot de
--- passe. root_ratio distingue une IP qui ne vise que root (outil de brute
--- force) d'une IP qui essaie une liste de noms et root parmi d'autres.
+-- D5 ciblage de root (T1110) : la moindre tentative sur root, par IP.
+-- Seuil à 1 parce que personne de légitime ne se connecte en root par mot de
+-- passe. root_ratio sert à voir si l'IP ne vise que root ou si root est juste
+-- un nom parmi d'autres dans sa liste.
 CREATE VIEW detect.d5_root_targeting AS
 WITH by_ip AS (
   SELECT
@@ -217,8 +206,7 @@ FROM by_ip
 WHERE coalesce(root_failures, 0) + root_successes > 0;
 
 
--- Toutes les alertes dans un format commun, pour le rapport.
--- severity : critical > high > medium > low.
+-- toutes les alertes au même format, c'est ce que lit le rapport
 CREATE VIEW detect.alerts AS
 SELECT 'D1' AS detection, 'Brute force' AS name, 'T1110.001' AS attack_technique,
        'high' AS severity, src_ip, NULL::text AS username,

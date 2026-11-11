@@ -1,12 +1,9 @@
-"""Tests des vues de détection (sql/004_detections.sql). Ont besoin de la base
-avec mart chargé, sinon ils sont ignorés.
+"""Tests des vues de détection. Il faut la base avec mart chargé.
 
-Deux sortes de tests :
-- sur les vraies données (OpenSSH_2k.log) : les chiffres attendus viennent de
-  l'analyse à la main du README ;
-- sur des événements fictifs : insérés dans une transaction puis annulés
-  (rollback), la base n'est jamais modifiée. Ça permet de tester D3, qui ne
-  sonne pas sur le fichier, et les effets de seuil (9 échecs : rien, 10 : alerte).
+Certains tests vérifient les chiffres sur le vrai fichier (ceux de mon analyse
+à la main). Les autres insèrent de faux événements dans une transaction que
+j'annule à la fin, la base n'est jamais modifiée. C'est le seul moyen de tester
+D3, qui ne sonne pas sur le fichier, et de voir les seuils (9 échecs rien, 10 alerte).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -17,7 +14,7 @@ import pytest
 from sentinel.detect import create_views
 from sentinel.load_mart import DSN
 
-# 198.51.100.0/24 : plage réservée à la documentation (RFC 5737), jamais dans de vrais logs.
+# 198.51.100.0/24 est réservée à la doc (RFC 5737), elle n'apparaîtra jamais dans de vrais logs
 TEST_IP = "198.51.100.7"
 T0 = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -44,7 +41,7 @@ def conn():
 
 @pytest.fixture
 def cur(conn):
-    """Curseur dans une transaction annulée à la fin du test."""
+    # tout ce que fait le test est annulé à la fin
     with conn.cursor() as c:
         yield c
     conn.rollback()
@@ -56,7 +53,7 @@ def rows(cur, sql, params=None):
 
 
 class Fake:
-    """Insère des faits fictifs pour TEST_IP (annulés par le rollback du fixture cur)."""
+    """Petit helper pour insérer de faux faits depuis TEST_IP."""
 
     def __init__(self, cur):
         self.cur = cur
@@ -92,7 +89,7 @@ def alerts_for_test_ip(cur, view):
     return rows(cur, f"SELECT * FROM detect.{view} WHERE src_ip = %s", [TEST_IP])
 
 
-# --- Vraies données -----------------------------------------------------------
+# sur le vrai fichier
 
 def test_d1_les_ip_du_readme(cur):
     ips = {r[0] for r in rows(cur, "SELECT host(src_ip) FROM detect.d1_brute_force")}
@@ -105,7 +102,7 @@ def test_d1_pic_de_183_62_140_253(cur):
 
 
 def test_d3_aucune_alerte_sur_le_fichier(cur):
-    # La seule connexion réussie (fztu) n'a eu aucun échec avant : README, analyse à la main.
+    # la seule connexion réussie (fztu) n'a aucun échec avant, je l'avais vu à la main
     assert rows(cur, "SELECT count(*) FROM detect.d3_success_after_failures") == [(0,)]
 
 
@@ -126,7 +123,7 @@ def test_alerts_reprend_toutes_les_vues(cur):
     assert rows(cur, "SELECT count(*) FROM detect.alerts") == [(total,)]
 
 
-# --- Événements fictifs -------------------------------------------------------
+# avec de faux événements
 
 def test_d1_9_echecs_ne_sonnent_pas(cur):
     f = Fake(cur)
@@ -143,7 +140,7 @@ def test_d1_10_echecs_en_5_min_sonnent(cur):
 
 
 def test_d1_compte_les_messages_repetes(cur):
-    # 2 lignes "message repeated 5 times" = 10 tentatives : doit sonner.
+    # 2 lignes "repeated 5 times" = 10 tentatives, ça doit sonner
     f = Fake(cur)
     f.fail(0, attempts=5)
     f.fail(1, attempts=5)
@@ -158,7 +155,7 @@ def test_d1_ignore_les_sondes_none(cur):
 
 
 def test_d1_echecs_trop_espaces_ne_sonnent_pas(cur):
-    # 10 échecs, mais un toutes les minutes : jamais 10 dans la même fenêtre de 5 min.
+    # 10 échecs mais un par minute, jamais 10 dans la même fenêtre de 5 min
     f = Fake(cur)
     for i in range(10):
         f.fail(i)
@@ -193,7 +190,7 @@ def test_d3_succes_apres_5_echecs_sonne(cur):
         f.fail(i)
     f.success(20)
     (alert,) = alerts_for_test_ip(cur, "d3_success_after_failures")
-    assert alert[1] == "alice"          # username
+    assert alert[1] == "alice"
     assert alert[4] == 5                # failed_attempts
     assert alert[7] is True             # same_user_failed
 
@@ -227,7 +224,7 @@ def test_d4_20_comptes_inexistants_sonnent(cur):
     f = Fake(cur)
     for i in range(20):
         f.user(f"__ghost{i}", exists=False)
-        f.event(i * 30, "invalid_user", f"__ghost{i}")  # étalé sur 10 h : D4 n'a pas de fenêtre
+        f.event(i * 30, "invalid_user", f"__ghost{i}")  # étalé sur 10 h, D4 n'a pas de fenêtre
     assert alerts_for_test_ip(cur, "d4_user_enumeration")[0][3] == 20
 
 

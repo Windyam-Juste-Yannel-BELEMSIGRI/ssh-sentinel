@@ -1,11 +1,11 @@
--- Grain de la table de faits : 1 ligne = 1 événement d'authentification écrit par sshd
--- (auth_failure, auth_success, invalid_user). Les lignes PAM sont exclues : elles
--- doublent les échecs SSH et feraient compter chaque tentative deux fois.
+-- Une ligne de fait = un événement d'authentification écrit par sshd
+-- (auth_failure, auth_success, invalid_user). Pas les lignes PAM, elles
+-- répètent les échecs de sshd et tout compterait double.
 --
--- Rejouable : tout est en IF NOT EXISTS. load_mart.py lance aussi ce fichier,
--- donc pas besoin de le passer à la main sur une base qui existe déjà.
+-- Tout est en IF NOT EXISTS et load_mart.py lance ce fichier lui-même,
+-- pas besoin de le passer à la main.
 
--- Une ligne par adresse IP source vue dans les logs.
+-- une ligne par IP vue dans les logs
 CREATE TABLE IF NOT EXISTS mart.dim_ip (
   ip_key          serial      PRIMARY KEY,
   src_ip          inet        NOT NULL UNIQUE,
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS mart.dim_ip (
   is_private      boolean     NOT NULL DEFAULT false    -- 10/8, 172.16/12, 192.168/16
 );
 
--- Une ligne par nom d'utilisateur tenté.
+-- une ligne par nom essayé
 CREATE TABLE IF NOT EXISTS mart.dim_user (
   user_key        serial      PRIMARY KEY,
   username        text        NOT NULL UNIQUE,
@@ -42,6 +42,6 @@ CREATE TABLE IF NOT EXISTS mart.fact_auth_event (
     CHECK (event_type IN ('auth_failure', 'auth_success', 'invalid_user'))
 );
 
--- Les détections regardent "une IP sur une fenêtre de temps" et "un type d'événement".
+-- les détections cherchent par IP et par type, sur des fenêtres de temps
 CREATE INDEX IF NOT EXISTS fact_auth_event_ip_ts   ON mart.fact_auth_event (ip_key, event_ts);
 CREATE INDEX IF NOT EXISTS fact_auth_event_type_ts ON mart.fact_auth_event (event_type, event_ts);

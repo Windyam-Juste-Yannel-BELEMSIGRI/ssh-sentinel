@@ -1,9 +1,8 @@
-"""Découpe une ligne de log SSH (format syslog) en champs structurés.
+"""Découpe une ligne de log SSH (format syslog) en champs.
 
-Ce module ne touche pas à la base de données : il reçoit du texte et renvoie
-un objet Python. C'est ce qui le rend simple à tester avec pytest.
+Pas de base de données ici : on donne une ligne, on récupère un objet. Comme ça
+je teste tout avec pytest sans lancer PostgreSQL.
 
-Exemple de ligne :
     Dec 10 09:32:20 LabSZ sshd[24680]: Accepted password for fztu from 119.137.62.142 port 49116 ssh2
    └───── date ────┘└hôte┘└proc┘└pid┘ └───────────────────────── message ─────────────────────────────┘
 """
@@ -15,16 +14,15 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 
-# Les mois sont convertis avec un dictionnaire plutôt qu'avec strptime("%b") :
-# strptime dépend de la langue du système (sur un Windows en français, "Dec"
-# ne serait pas reconnu, il attendrait "déc.").
+# Pas de strptime("%b") pour les mois, ça dépend de la langue du système :
+# sur un Windows en français il attend "déc." et "Dec" ne passe pas.
 MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
-# En-tête syslog : "Dec 10 06:55:46 LabSZ sshd[24200]: <message>"
-# \s+ entre le mois et le jour car syslog écrit "Dec  1" (deux espaces) pour les jours < 10.
+# "Dec 10 06:55:46 LabSZ sshd[24200]: <message>"
+# \s+ après le mois parce que pour les jours < 10 syslog met deux espaces ("Dec  1")
 HEADER_RE = re.compile(
     r"^(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
     r"(?P<time>\d{2}:\d{2}:\d{2})\s+"
@@ -34,14 +32,14 @@ HEADER_RE = re.compile(
 )
 
 # "message repeated 5 times: [ Failed password for root from ... ]"
-# syslog regroupe des messages identiques consécutifs : une ligne = N événements.
+# attention : cette ligne vaut 5 tentatives, pas 1
 REPEATED_RE = re.compile(r"^message repeated (?P<n>\d+) times: \[\s*(?P<inner>.*?)\s*\]$")
 
 PREAUTH_SUFFIX = " [preauth]"
 
-# Liste ordonnée (type d'événement, regex). La première qui correspond gagne.
-# Les noms d'utilisateur utilisent (?P<user>.*?) et non \S+ : ils sont choisis
-# par l'attaquant et peuvent contenir des espaces (ex : "invalid user  0101").
+# Testées dans l'ordre, la première qui matche donne le type.
+# Pour le user je prends tout jusqu'à " from " au lieu de \S+ : c'est l'attaquant
+# qui choisit le nom, il peut y avoir des espaces dedans ("invalid user  0101").
 MESSAGE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("auth_success", re.compile(
         r"^Accepted (?P<method>\S+) for (?P<user>.*?) from (?P<ip>\S+) port (?P<port>\d+)")),
@@ -83,29 +81,29 @@ MESSAGE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 @dataclass
 class ParsedEvent:
-    """Une ligne de log découpée. Les champs absents de la ligne valent None."""
+    """Une ligne découpée. Ce qui n'est pas dans la ligne reste à None."""
 
     month: int
     day: int
-    time: str                       # "HH:MM:SS" ; l'année est ajoutée plus tard
+    time: str                       # pas d'année dans syslog, elle est ajoutée après
     host: str
     process: str
     pid: int | None
-    event_type: str                 # "unknown" si aucun motif ne correspond
+    event_type: str                 # "unknown" si aucune regex ne matche
     message: str
     username: str | None = None
-    src_ip: str | None = None       # adresse IP valide uniquement
+    src_ip: str | None = None
     src_port: int | None = None
     src_host: str | None = None     # nom d'hôte quand la source n'est pas une IP
-    auth_method: str | None = None  # password, publickey, none...
+    auth_method: str | None = None  # password, publickey, none
     invalid_user: bool | None = None
-    preauth: bool = False           # message émis avant la fin de l'authentification
-    repeat_count: int = 1           # > 1 pour "message repeated N times"
-    detail: str | None = None       # info complémentaire (raison, compteur PAM...)
+    preauth: bool = False
+    repeat_count: int = 1           # N pour "message repeated N times"
+    detail: str | None = None
 
 
 def _split_ip_or_host(value: str | None) -> tuple[str | None, str | None]:
-    """Renvoie (ip, None) si value est une adresse IP, sinon (None, hostname)."""
+    # PAM met parfois un nom d'hôte dans rhost au lieu d'une IP
     if not value:
         return None, None
     try:
@@ -115,7 +113,6 @@ def _split_ip_or_host(value: str | None) -> tuple[str | None, str | None]:
 
 
 def _parse_message(message: str) -> dict:
-    """Identifie le type d'un message et extrait ses champs."""
     fields: dict = {"repeat_count": 1, "preauth": False}
 
     repeated = REPEATED_RE.match(message)
@@ -154,7 +151,7 @@ def _parse_message(message: str) -> dict:
 
 
 def parse_line(line: str) -> ParsedEvent | None:
-    """Découpe une ligne. Renvoie None si l'en-tête syslog n'est pas reconnu."""
+    """None si l'en-tête syslog n'est pas reconnu."""
     header = HEADER_RE.match(line.rstrip("\r\n"))
     if not header:
         return None
@@ -178,14 +175,12 @@ def resolve_timestamp(
     tz: tzinfo = timezone.utc,
     year: int | None = None,
 ) -> datetime | None:
-    """Reconstitue la date complète d'un événement.
+    """Remet l'année et le fuseau, que syslog n'écrit pas.
 
-    syslog n'écrit ni l'année ni le fuseau horaire. Deux règles :
-    - si `year` est donné, on l'utilise tel quel ;
-    - sinon, on prend l'année de `reference` (la date d'ingestion), et si la
-      date obtenue tombe dans le futur, on recule d'un an. C'est la règle
-      utilisée par rsyslog ou Logstash : un log lu en janvier qui dit "Dec 31"
-      date forcément de l'année précédente.
+    Si on donne `year`, on le prend. Sinon je prends l'année de `reference`
+    (la date de chargement) et si ça tombe dans le futur je recule d'un an,
+    comme rsyslog et Logstash : un log lu en janvier qui dit "Dec 31", c'est
+    forcément l'année d'avant.
     """
     if not 1 <= event.month <= 12:
         return None
@@ -193,7 +188,7 @@ def resolve_timestamp(
     y = year if year is not None else reference.year
     try:
         ts = datetime(y, event.month, event.day, hh, mm, ss, tzinfo=tz)
-    except ValueError:  # ex : 29 février d'une année non bissextile
+    except ValueError:  # 29 février sur une année pas bissextile
         return None
     if year is None and ts > reference + timedelta(days=1):
         ts = ts.replace(year=y - 1)

@@ -1,12 +1,11 @@
 """stg.auth_events -> mart (dim_ip, dim_user, fact_auth_event)
 
-Tout se fait en SQL dans la base : Python ne fait qu'envoyer les requêtes, dans
-une seule transaction. Soit tout passe, soit rien n'est modifié.
+Tout le travail est fait en SQL, Python envoie juste les requêtes, dans une
+seule transaction : soit tout passe, soit rien ne change.
 
-Relançable sans risque :
-- les dimensions et les faits sont en upsert (ON CONFLICT DO UPDATE) ;
-- les faits dont la ligne stg n'est plus un événement d'authentification
-  (par exemple après une correction du parser) sont supprimés.
+On peut relancer : tout est en upsert, et si un fait ne correspond plus à un
+événement d'authentification dans stg (après une correction du parser par
+exemple), il est supprimé.
 
 Usage :
     python src/sentinel/load_mart.py
@@ -19,9 +18,8 @@ import psycopg
 DSN = "postgresql://sentinel:sentinel@localhost:5433/sentinel"
 DDL_FILE = Path(__file__).resolve().parents[2] / "sql" / "003_mart.sql"
 
-# Les seuls types d'événements qui vont dans la table de faits.
-# Les lignes PAM (pam_auth_failure, pam_more_failures...) sont volontairement
-# exclues : elles répètent les échecs déjà écrits par sshd.
+# Ce qui va dans les faits. Pas les lignes PAM : elles répètent les échecs
+# que sshd a déjà écrits, ça compterait double.
 FACT_EVENT_TYPES = ("auth_failure", "auth_success", "invalid_user")
 
 DELETE_STALE_FACTS = """
@@ -36,8 +34,8 @@ WHERE NOT EXISTS (
 )
 """
 
-# dim_ip : on prend TOUTES les lignes stg qui ont une IP, pas seulement les faits,
-# pour avoir la vraie première / dernière apparition et le DNS inverse.
+# Pour dim_ip je prends toutes les lignes avec une IP, pas que les faits,
+# sinon je rate la vraie première apparition et le DNS inverse.
 UPSERT_DIM_IP = """
 INSERT INTO mart.dim_ip (src_ip, first_seen, last_seen, ptr_host, reverse_dns_mismatch, is_private)
 SELECT
@@ -58,12 +56,10 @@ ON CONFLICT (src_ip) DO UPDATE SET
   is_private = EXCLUDED.is_private
 """
 
-# dim_user : est-ce que le compte existe sur le serveur ?
-# - oui si on le voit dans une connexion réussie, une session, un échec PAM
-#   (PAM ne parle que des comptes qu'il connaît) ou un "Failed password for X"
-#   sans "invalid user" ;
-# - non s'il n'apparaît que comme "invalid user" ;
-# - NULL sinon (on ne sait pas).
+# account_exists : le compte existe sur le serveur si on le voit se connecter,
+# ouvrir une session, dans un échec PAM (PAM ne parle que des comptes qu'il
+# connaît) ou dans un "Failed password for X" sans "invalid user".
+# Faux s'il n'apparaît qu'en "invalid user". NULL si on ne peut pas savoir.
 UPSERT_DIM_USER = """
 INSERT INTO mart.dim_user (username, is_root, account_exists, first_seen, last_seen)
 SELECT
@@ -126,10 +122,9 @@ def load() -> tuple[int, int, int, int]:
     params = {"types": list(FACT_EVENT_TYPES)}
     with psycopg.connect(DSN) as conn:
         with conn.cursor() as cur:
-            # Crée les tables si besoin (la base peut exister d'avant 003_mart.sql).
+            # la base peut dater d'avant 003_mart.sql
             cur.execute(DDL_FILE.read_text(encoding="utf-8"))
-            # Ordre important : on nettoie, puis les dimensions, puis les faits
-            # (les faits ont besoin des clés des dimensions).
+            # l'ordre compte : les faits ont besoin des clés des dimensions
             cur.execute(DELETE_STALE_FACTS, params)
             cur.execute(UPSERT_DIM_IP)
             cur.execute(UPSERT_DIM_USER)

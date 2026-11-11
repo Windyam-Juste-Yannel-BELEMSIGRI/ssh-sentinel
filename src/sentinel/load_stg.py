@@ -1,8 +1,8 @@
 """raw.auth_lines -> stg.auth_events
 
-Lit les lignes brutes, les découpe avec parser.py et écrit le résultat dans stg.
-Relançable sans risque : une ligne déjà présente est mise à jour, pas dupliquée.
-C'est ce qui permet de corriger le parser puis de tout rejouer.
+Lit les lignes brutes, les passe dans parser.py et écrit dans stg.
+On peut relancer autant qu'on veut : une ligne déjà là est mise à jour, pas
+dupliquée. C'est ce qui me permet de corriger le parser et de tout rejouer.
 
 Usage :
     python src/sentinel/load_stg.py                 # année déduite, fuseau UTC
@@ -20,8 +20,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 
-# Permet de lancer le script directement (python src/sentinel/load_stg.py)
-# tout en important le parser comme un module du paquet "sentinel".
+# pour pouvoir lancer le script directement et quand même importer sentinel.parser
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sentinel.parser import parse_line, resolve_timestamp  # noqa: E402
 
@@ -45,7 +44,7 @@ ON CONFLICT (source_file, line_no) DO UPDATE SET
 
 
 def get_timezone(name: str):
-    # Sous Windows, ZoneInfo a besoin du paquet "tzdata" (voir requirements.txt).
+    # sous Windows il faut le paquet tzdata pour ZoneInfo
     return timezone.utc if name.upper() == "UTC" else ZoneInfo(name)
 
 

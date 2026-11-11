@@ -1,12 +1,11 @@
 """fichier de logs -> raw.auth_lines
 
-Chaque ligne est copiée telle quelle. Relançable : une ligne déjà chargée
-(même fichier, même numéro de ligne) est ignorée.
+Copie chaque ligne telle quelle. Si une ligne est déjà là (même fichier, même
+numéro), elle est ignorée, donc on peut relancer.
 
-Deux méthodes :
-- copy (défaut) : COPY dans une table temporaire, puis INSERT ... ON CONFLICT
-  vers raw.auth_lines. COPY seul ne sait pas ignorer les doublons, d'où le détour ;
-- insert : un INSERT par ligne (executemany), l'ancienne version.
+--method copy (par défaut) : COPY dans une table temporaire puis INSERT ... ON
+CONFLICT. COPY tout seul ne sait pas ignorer les doublons, d'où le détour.
+--method insert : un INSERT par ligne, l'ancienne version, gardée pour comparer.
 
 Usage :
     python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log

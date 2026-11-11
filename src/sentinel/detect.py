@@ -1,8 +1,6 @@
-"""mart -> detect : (re)crée les vues de détection et affiche les alertes.
+"""Recrée les vues de détection (sql/004_detections.sql) et affiche les alertes.
 
-Les vues sont dans sql/004_detections.sql. Ce script relance le fichier à chaque
-fois (le schéma detect ne contient que des vues, on peut le recréer sans rien
-perdre), puis lit detect.alerts.
+Le schéma detect n'a que des vues, donc je le recrée à chaque fois sans rien perdre.
 
 Usage :
     python src/sentinel/detect.py
@@ -13,7 +11,7 @@ from pathlib import Path
 
 import psycopg
 
-# Permet de lancer le script directement (python src/sentinel/detect.py).
+# pour lancer le script directement
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sentinel.load_mart import DSN  # noqa: E402
 
@@ -42,7 +40,7 @@ def fetch_alerts(conn: psycopg.Connection) -> list[tuple]:
 
 def main() -> None:
     with psycopg.connect(DSN) as conn:
-        conn.add_notice_handler(lambda _: None)  # "drop cascades to view ..." : pas utile ici
+        conn.add_notice_handler(lambda _: None)  # sinon PostgreSQL affiche tous les "drop cascades"
         create_views(conn)
         alerts = fetch_alerts(conn)
 

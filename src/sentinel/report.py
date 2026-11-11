@@ -1,7 +1,6 @@
-"""detect -> reports/report.md
+"""Écrit reports/report.md à partir des alertes.
 
-Recrée les vues de détection puis écrit le rapport en Markdown.
-Tout ce qui est dans le rapport vient de la base, rien n'est écrit à la main.
+Tous les chiffres viennent de la base, rien n'est écrit à la main.
 
 Usage :
     python src/sentinel/report.py
@@ -50,7 +49,7 @@ GROUP BY d.detection, d.name, d.technique
 ORDER BY d.detection
 """
 
-# Une ligne par IP qui a au moins une alerte, de la plus grave à la moins grave.
+# une ligne par IP alertée, les plus graves en premier
 BY_IP = f"""
 WITH alerted AS (
   SELECT src_ip,
