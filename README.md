@@ -49,12 +49,12 @@ pip install -r requirements.txt
 mkdir -p data/raw
 curl -L -o data/raw/OpenSSH_2k.log https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log
 
-python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log   # -> 2000 lignes chargées
+python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log   # -> 2000 lignes chargées (COPY par défaut)
 python src/sentinel/load_stg.py                           # -> 2000 lignes traitées, 0 non reconnue
 python src/sentinel/load_mart.py                          # -> 30 IP, 64 users, 638 événements
 python src/sentinel/detect.py                             # -> 23 alertes
 python src/sentinel/report.py                             # -> reports/report.md
-pytest                                                    # 60 tests (test_mart.py et test_detections.py ont besoin de la base)
+pytest                                                    # 63 tests (tous sauf test_parser.py ont besoin de la base)
 ```
 
 Vérifier dans la base :
@@ -257,6 +257,34 @@ Le rapport (`reports/report.md`) est écrit par `report.py`, uniquement à parti
 
 ---
 
+## `INSERT` ou `COPY` ?
+
+Pour 2000 lignes ça ne change rien. J'ai voulu voir sur le vrai volume : le fichier complet de Loghub, `SSH.log`, 655 147 lignes (73 Mo).
+
+```bash
+mkdir -p data/full
+curl -L -o data/full/SSH.tar.gz "https://zenodo.org/records/8196385/files/SSH.tar.gz?download=1"
+tar -xzf data/full/SSH.tar.gz -C data/full
+
+python src/sentinel/load_raw.py data/full/SSH.log --method insert
+python src/sentinel/load_raw.py data/full/SSH.log --method copy
+```
+
+`COPY` ne sait pas faire `ON CONFLICT`. Pour garder l'idempotence, je fais un `COPY` dans une table temporaire, puis un `INSERT ... SELECT ... ON CONFLICT DO NOTHING` vers `raw.auth_lines`.
+
+Trois essais par méthode (en supprimant les lignes entre chaque essai), sur mon PC en local :
+
+| | 1er chargement | Relance (tout est déjà là) |
+| --- | --- | --- |
+| `INSERT` (`executemany`) | 3,4 s | 3,1 s |
+| `COPY` + table temporaire | 2,1 s | 1,2 s |
+
+`COPY` est 1,6 fois plus rapide au premier chargement et 2,5 fois à la relance. Moins que ce que j'attendais : psycopg 3 envoie déjà les `executemany` en pipeline, sans attendre la réponse de chaque ligne. J'ai gardé `COPY` par défaut, `--method insert` reste là pour comparer.
+
+Après le test j'ai supprimé `SSH.log` de `raw` : il contient les 2000 lignes de `OpenSSH_2k.log`, elles compteraient deux fois dans les détections.
+
+---
+
 ## Galères et solutions
 
 | Problème | Cause | Ce que j'ai fait |
@@ -287,7 +315,7 @@ ssh-sentinel/
 │   ├── 003_mart.sql          # dim_ip, dim_user, fact_auth_event
 │   └── 004_detections.sql    # vues D1 à D5 + detect.alerts
 ├── src/sentinel/
-│   ├── load_raw.py           # fichier -> raw.auth_lines
+│   ├── load_raw.py           # fichier -> raw.auth_lines (COPY ou INSERT)
 │   ├── parser.py             # ligne -> champs (regex, sans base)
 │   ├── load_stg.py           # raw -> stg.auth_events
 │   ├── load_mart.py          # stg -> mart (SQL, une transaction)
@@ -297,9 +325,10 @@ ssh-sentinel/
 │   └── report.md             # rapport sur OpenSSH_2k.log
 ├── tests/
 │   ├── test_parser.py        # 32 tests, sans base
+│   ├── test_raw.py           # 3 tests, avec la base (COPY et INSERT, relance)
 │   ├── test_mart.py          # 8 tests, avec la base (ignorés si elle est éteinte)
 │   └── test_detections.py    # 20 tests, avec la base (faux événements annulés par rollback)
-└── data/raw/                 # logs, pas dans git
+└── data/                     # logs (raw/ et full/), pas dans git
 ```
 
 ---
@@ -312,7 +341,7 @@ ssh-sentinel/
 - [x] Parser regex + tests pytest
 - [x] Année et fuseau horaire
 - [x] Modèle en étoile dans `mart` + tests
-- [ ] Comparer `INSERT` et `COPY` sur le jeu complet (~655 000 lignes)
+- [x] Comparer `INSERT` et `COPY` sur le jeu complet (655 147 lignes)
 - [x] Les 5 détections (voir la section `detect`) :
 
 | # | Détection | Règle de départ | ATT&CK |
