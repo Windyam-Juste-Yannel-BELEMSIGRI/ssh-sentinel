@@ -17,6 +17,8 @@ OpenSSH_2k.log ──> load_raw.py ──> raw.auth_lines
                                                      load_mart.py ──> mart (dim_ip, dim_user, fact_auth_event)
                                                                                  │
                                                                             detect.py ──> detect (vues D1 à D5 + detect.alerts)
+                                                                                                     │
+                                                                                                report.py ──> reports/report.md
 ```
 
 Tout tourne dans PostgreSQL 16 sous Docker, sur le port **5433**.
@@ -51,6 +53,7 @@ python src/sentinel/load_raw.py data/raw/OpenSSH_2k.log   # -> 2000 lignes charg
 python src/sentinel/load_stg.py                           # -> 2000 lignes traitées, 0 non reconnue
 python src/sentinel/load_mart.py                          # -> 30 IP, 64 users, 638 événements
 python src/sentinel/detect.py                             # -> 23 alertes
+python src/sentinel/report.py                             # -> reports/report.md
 pytest                                                    # 60 tests (test_mart.py et test_detections.py ont besoin de la base)
 ```
 
@@ -214,7 +217,9 @@ L'ordre compte : les faits ont besoin des clés des dimensions. Relancé deux fo
 | D4 | `d4_user_enumeration` | 20 comptes inexistants ou plus depuis une IP | T1110 | medium | 1 |
 | D5 | `d5_root_targeting` | Toute tentative sur root, par IP | T1110 | low → critical | 10 |
 
-`detect.alerts` met les 5 vues au même format (détection, technique, gravité, IP, user, début, fin, score, détail en français). C'est elle que lira le rapport.
+`detect.alerts` met les 5 vues au même format (détection, technique, gravité, IP, user, début, fin, score, détail en français). C'est elle que lit le rapport.
+
+Le rapport (`reports/report.md`) est écrit par `report.py`, uniquement à partir de la base : résumé, alertes par détection, une ligne par IP avec toutes ses détections (pour ne pas lire trois fois la même attaque), les connexions réussies et le détail des alertes. [Le rapport sur OpenSSH_2k.log](reports/report.md).
 
 **Comment ça marche :**
 
@@ -286,7 +291,10 @@ ssh-sentinel/
 │   ├── parser.py             # ligne -> champs (regex, sans base)
 │   ├── load_stg.py           # raw -> stg.auth_events
 │   ├── load_mart.py          # stg -> mart (SQL, une transaction)
-│   └── detect.py             # crée les vues et affiche les alertes
+│   ├── detect.py             # crée les vues et affiche les alertes
+│   └── report.py             # écrit reports/report.md
+├── reports/
+│   └── report.md             # rapport sur OpenSSH_2k.log
 ├── tests/
 │   ├── test_parser.py        # 32 tests, sans base
 │   ├── test_mart.py          # 8 tests, avec la base (ignorés si elle est éteinte)
@@ -318,4 +326,4 @@ ssh-sentinel/
 Écrites en vues SQL dans `sql/004_detections.sql`, testées avec des faux événements.
 
 - [ ] Attaque simulée avec Hydra entre mes propres VM, vérifier que D1 et D3 sonnent
-- [ ] Rapport généré automatiquement (`reports/report.md`) à partir de `detect.alerts`, regroupé par IP
+- [x] Rapport généré automatiquement (`reports/report.md`)

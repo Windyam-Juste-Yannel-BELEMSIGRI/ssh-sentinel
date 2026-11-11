@@ -249,6 +249,9 @@ SELECT 'D5', 'Ciblage de root', 'T1110',
        CASE WHEN root_successes > 0 THEN 'critical'
             WHEN root_failures >= 10 THEN 'medium' ELSE 'low' END,
        src_ip, 'root', window_start, window_end, root_failures + root_successes,
-       format('%s échecs et %s succès sur root, %s %% de ses échecs visent root',
-              root_failures, root_successes, round(coalesce(root_ratio, 0) * 100))
+       format('%s sur root%s, %s %% de ses échecs visent root',
+              CASE WHEN root_failures > 1 THEN root_failures || ' échecs'
+                   ELSE root_failures || ' échec' END,
+              CASE WHEN root_successes > 0 THEN format(' et %s succès', root_successes) ELSE '' END,
+              round(coalesce(root_ratio, 0) * 100))
 FROM detect.d5_root_targeting;
