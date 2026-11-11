@@ -207,7 +207,7 @@ L'ordre compte : les faits ont besoin des clés des dimensions. Relancé deux fo
 
 ## Les détections (`detect`)
 
-`sql/004_detections.sql` crée un schéma `detect` qui ne contient **que des vues** : aucune donnée n'y est stockée, donc le fichier commence par `DROP SCHEMA detect CASCADE` et recrée tout. Comme ça je peux changer les colonnes d'une vue sans me battre avec `CREATE OR REPLACE VIEW` (qui refuse). `detect.py` lance le fichier puis affiche les alertes.
+`sql/004_detections.sql` crée un schéma `detect` qui ne contient que des vues : aucune donnée n'y est stockée, donc le fichier commence par `DROP SCHEMA detect CASCADE` et recrée tout. Comme ça je peux changer les colonnes d'une vue sans me battre avec `CREATE OR REPLACE VIEW` (qui refuse). `detect.py` lance le fichier puis affiche les alertes.
 
 | # | Vue | Règle | ATT&CK | Gravité | Alertes |
 | --- | --- | --- | --- | --- | --- |
@@ -221,24 +221,40 @@ L'ordre compte : les faits ont besoin des clés des dimensions. Relancé deux fo
 
 Le rapport (`reports/report.md`) est écrit par `report.py`, uniquement à partir de la base : résumé, alertes par détection, une ligne par IP avec toutes ses détections (pour ne pas lire trois fois la même attaque), les connexions réussies et le détail des alertes. [Le rapport sur OpenSSH_2k.log](reports/report.md).
 
-**Comment ça marche :**
+### Comment ça marche
 
-- **D1** : `sum(attempts) OVER (PARTITION BY ip ORDER BY event_ts RANGE BETWEEN '5 minutes' PRECEDING AND CURRENT ROW)`. `RANGE` et pas `ROWS` : la fenêtre est en temps, pas en nombre de lignes. Seulement `auth_method = 'password'` (pas les sondes `none`).
-- **Épisodes** : sans ça, une IP qui fait 286 échecs donnerait des centaines d'alertes (une par ligne au-dessus du seuil). Je regroupe les déclenchements : nouvel épisode si plus de 5 min séparent deux déclenchements (technique *gaps and islands* : `lag()` puis somme cumulée). `103.99.0.122` attaque deux fois à 2 h d'écart → 2 alertes.
-- **D2** : PostgreSQL ne sait pas faire `count(DISTINCT ...)` en fonction de fenêtre. Je passe par un `LATERAL` qui compte, pour chaque événement, les comptes distincts de la même IP dans les 10 min d'avant. Je prends les `auth_failure` et les `invalid_user` (distincts, donc pas de double compte).
-- **D3** : pour chaque `auth_success`, un `LATERAL` additionne les échecs de la même IP dans les 30 min d'avant. `same_user_failed` dit si le compte qui a réussi faisait partie des comptes ratés (mot de passe deviné) ou pas (l'attaquant a peut-être un autre accès).
-- **D4** : pas de fenêtre, toute la période. Repose sur `dim_user.account_exists = false`.
-- **D5** : seuil à 1. `root_ratio` = part des échecs de l'IP qui visent root. Gravité `critical` s'il y a un succès sur root, `medium` à partir de 10 échecs, `low` sinon.
+D1 compte les échecs de chaque IP sur les 5 dernières minutes avec une fonction de fenêtre :
 
-**Ce que ça donne sur le fichier :** 23 alertes. Les 4 grosses IP de mon analyse à la main sont toutes là. `187.141.143.180` sonne sur D1, D2, D4 et D5 : c'est l'IP la plus complète (et celle qui a un DNS inverse faux). D3 ne sonne pas, comme prévu (`fztu` n'a aucun échec avant).
+```sql
+sum(attempts) OVER (PARTITION BY ip_key ORDER BY event_ts
+                    RANGE BETWEEN interval '5 minutes' PRECEDING AND CURRENT ROW)
+```
 
-**Limites que j'ai vues :**
+`RANGE` et pas `ROWS`, parce que la fenêtre est en temps et pas en nombre de lignes. Je ne garde que `auth_method = 'password'`, les `none` sont des sondes du client.
 
-- **D1 et D2 se recoupent** : un brute force sur une liste de noms coche les deux. Normal, c'est le même attaquant vu sous deux angles. Le rapport devra regrouper par IP.
-- **`183.62.140.253` sort en D2** (10 comptes en 10 min) alors que 97 % de ses essais visent root : c'est du brute force, pas du spraying. Sans les mots de passe dans les logs, je ne peux pas voir le vrai spraying (« un mot de passe, plein de comptes »). On pourrait exiger un `root_ratio` faible pour D2, à voir avec plus de données.
-- Les seuils sont en dur dans une CTE `params` au début de chaque vue. Pour les régler il faut modifier le SQL.
+Sans regroupement, on aurait une alerte par ligne au-dessus du seuil, donc des centaines pour `183.62.140.253`. Je regroupe donc les déclenchements en épisodes : si plus de 5 minutes séparent deux déclenchements, c'est un nouvel épisode (`lag()` puis une somme cumulée, la technique *gaps and islands*). `103.99.0.122` attaque deux fois à 2 h d'écart, ça donne 2 alertes.
 
-**Les tests** (`test_detections.py`, 20 tests) : 6 sur les vraies données (les chiffres du README) et 14 sur des événements **fictifs**. Ceux-là insèrent une IP de documentation (`198.51.100.7`, RFC 5737) et des faits, lisent la vue, puis font un `rollback` : la base n'est jamais modifiée. C'est comme ça que je teste D3 (qui ne sonne pas sur le fichier) et les effets de seuil : 9 échecs ne sonnent pas, 10 oui ; 2 lignes `repeated 5 times` sonnent ; 10 échecs étalés sur 10 min ne sonnent pas ; 4 échecs avant un succès non, 5 oui ; échecs 40 min avant le succès non.
+Pour D2, PostgreSQL ne sait pas faire `count(DISTINCT ...)` dans une fonction de fenêtre. Je passe par un `LATERAL` qui compte, pour chaque événement, les comptes différents essayés par la même IP dans les 10 minutes d'avant.
+
+D3 additionne, pour chaque connexion réussie, les échecs de la même IP dans les 30 minutes d'avant. La colonne `same_user_failed` dit si le compte qui a réussi faisait partie des comptes ratés.
+
+D4 n'a pas de fenêtre, il regarde toute la période et s'appuie sur `dim_user.account_exists = false`. D5 sonne dès la première tentative sur root. `root_ratio` donne la part des échecs de l'IP qui visent root.
+
+### Ce que ça donne
+
+23 alertes. Les 4 grosses IP que j'avais trouvées à la main sont toutes là. `187.141.143.180` sonne sur D1, D2, D4 et D5, et c'est aussi elle qui a un DNS inverse faux. D3 ne sonne pas, comme prévu : `fztu` n'a eu aucun échec avant de se connecter.
+
+Ce qui ne va pas encore :
+
+- D1 et D2 se recoupent. Un brute force sur une liste de noms coche les deux. C'est le même attaquant vu sous deux angles, c'est pour ça que le rapport regroupe tout par IP.
+- `183.62.140.253` sort en D2 (10 comptes en 10 minutes) alors que 97 % de ses essais visent root. C'est du brute force, pas du spraying. Les logs ne contiennent pas les mots de passe, donc je ne peux pas voir le vrai spraying (un mot de passe essayé sur plein de comptes). Il faudrait peut-être exiger un `root_ratio` faible pour D2, à voir avec plus de données.
+- Les seuils sont écrits en dur au début de chaque vue. Pour les changer, il faut modifier le SQL.
+
+### Les tests
+
+`test_detections.py` a 20 tests. 6 vérifient les chiffres sur les vraies données. Les 14 autres insèrent de faux événements depuis une IP réservée à la documentation (`198.51.100.7`), lisent la vue, puis annulent tout avec un `rollback`. La base n'est jamais modifiée.
+
+C'est comme ça que je teste D3, qui ne sonne pas sur le fichier, et les seuils : 9 échecs ne sonnent pas et 10 oui, 2 lignes `repeated 5 times` sonnent, 10 échecs étalés sur 10 minutes ne sonnent pas, 4 échecs avant un succès non et 5 oui.
 
 ---
 
